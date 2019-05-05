@@ -47,8 +47,8 @@ class TextCnnAE:
         self.params.kernel_sizes[-1] = max_seq_len
 
         # Create encoder rnn and decoder rnn module
-        self.encoder = Encoder(device, self.embedding, params, max_seq_len, kernel_sizes)
-        self.decoder = Decoder(device, self.embedding, params, max_seq_len, kernel_sizes)
+        self.encoder = Encoder(device, self.embedding, params, kernel_sizes)
+        self.decoder = Decoder(device, self.embedding, params, kernel_sizes, self.encoder.conv_layers)
         self.encoder.init_weights()
         self.decoder.init_weights()
 
@@ -140,7 +140,6 @@ class TextCnnAE:
 
         losses = [self.criterion(sentence_emb_matrix, word_ids) for sentence_emb_matrix, word_ids in zip(log_probs, inputs)]
         loss = sum([torch.sum(l) for l in losses]) / inputs.shape[0]
-
         # Backpropagation
         loss.backward()
         # Clip parameters
@@ -149,6 +148,8 @@ class TextCnnAE:
         #
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
+        # In case of tied weights, this should be True
+        #print(TextCnnAE.are_equal_tensors(self.encoder.conv_layers[0].weight, self.decoder.deconv_layers[-1].weight))
 
         return loss.item()
 
@@ -223,6 +224,12 @@ class TextCnnAE:
         return t.cpu().numpy()
 
 
+    @staticmethod
+    def are_equal_tensors(a, b):
+        if torch.all(torch.eq(a, b)).data.cpu().numpy() == 0:
+            return False
+        return True
+
 
 
 class RegularizationLayer(nn.Module):
@@ -251,7 +258,7 @@ class RegularizationLayer(nn.Module):
 
 class Encoder(nn.Module):
 
-    def __init__(self, device, embedding, params, last_seq_len, kernel_sizes):
+    def __init__(self, device, embedding, params, kernel_sizes):
         super(Encoder, self).__init__()
         self.params = params
         self.device = device
@@ -263,9 +270,9 @@ class Encoder(nn.Module):
         self.conv_layers = nn.ModuleList()
 
         if self.params.conv_mode == ConvMode.D1:
-            in_channels = [self.params.embed_dim] + self.params.num_filters
+            in_channels = [self.params.embed_dim] + self.params.num_filters.copy()
         else:
-            in_channels = [1] + self.params.num_filters
+            in_channels = [1] + self.params.num_filters.copy()
 
         for i in range(len(self.params.kernel_sizes)):
             if self.params.conv_mode == ConvMode.D1:
@@ -298,6 +305,9 @@ class Encoder(nn.Module):
                torch.nn.init.xavier_uniform_(m.weight)
             elif isinstance(m, nn.Embedding):
                 torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+            elif isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.bias.data.fill_(0.01)
 
 
 
@@ -338,7 +348,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
 
-    def __init__(self, device, embedding, params, last_seq_len, kernel_sizes):
+    def __init__(self, device, embedding, params, kernel_sizes, conv_layers):
         super(Decoder, self).__init__()
         self.params = params
         self.device = device
@@ -350,9 +360,9 @@ class Decoder(nn.Module):
         self.deconv_layers = nn.ModuleList()
 
         if self.params.conv_mode == ConvMode.D1:
-            out_channels = [self.params.embed_dim] + self.params.num_filters
+            out_channels = [self.params.embed_dim] + self.params.num_filters.copy()
         else:
-            out_channels = [1] + self.params.num_filters
+            out_channels = [1] + self.params.num_filters.copy()
 
         for i in range(len(self.params.kernel_sizes)-1, -1, -1):
             if self.params.conv_mode == ConvMode.D1:
@@ -367,14 +377,17 @@ class Decoder(nn.Module):
                                             kernel_size=kernel_sizes[i],
                                             stride=(self.params.strides[i], 1),
                                             output_padding=(self.params.output_paddings[i], 0))
+            # If set, tie weights of conv/deconv layers
+            if self.params.tie_weights == True:
+                deconv.weight = conv_layers[i].weight
             self.deconv_layers.append(deconv)
 
-        #print(self.deconv_layers)
         # Create all (L-1) regularization layers
         self.reg_layers = nn.ModuleList()
         for i in range(len(self.params.kernel_sizes)-1, 0, -1):
             reg = RegularizationLayer(self.params.conv_mode, self.params.num_filters[i-1], self.params.do_batch_norm, self.params.dropout_ratio)
             self.reg_layers.append(reg)
+
 
 
     def init_weights(self):
@@ -385,12 +398,14 @@ class Decoder(nn.Module):
                torch.nn.init.xavier_uniform_(m.weight)
             elif isinstance(m, nn.Embedding):
                 torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+            elif isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.bias.data.fill_(0.01)
 
 
 
     def forward(self, X):
         batch_size = X.shape[0]
-
         # Push through (L-1) ConvTranspose1d/ConvTranspose1d & regularization layers
         for i in range(len(self.params.kernel_sizes)-1):
             X = self.deconv_layers[i](X)

@@ -101,13 +101,19 @@ class TextRnnAE:
             epoch_loss += batch_loss
 
             if verbatim == True:
-                print('[{}] Epoch: {} #batches {}/{}, loss: {:.8f}, learning rates: {:.5f}/{:.5f}'.format(
+                print('[{}] Epoch: {} #batches {}/{}, loss: {:.8f}, learning rates: {:.6f}/{:.6f}'.format(
                     datetime.timedelta(seconds=int(timeit.default_timer() - start)), epoch + 1, idx + 1, num_batches,
                     (batch_loss / ((idx + 1) * batch_size)), self.encoder_lr, self.decoder_lr), end='\r')
 
         if verbatim == True:
             print()
         return epoch_loss
+
+    @staticmethod
+    def are_equal_tensors(a, b):
+        if torch.all(torch.eq(a, b)).data.cpu().numpy() == 0:
+            return False
+        return True
 
 
 
@@ -119,8 +125,8 @@ class TextRnnAE:
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
 
-        z = self.encoder(inputs)
-        loss = self.decoder(inputs, z)
+        z, h_enc = self.encoder(inputs)
+        loss = self.decoder(inputs, z, h_enc)
 
         # Backpropagation
         loss.backward()
@@ -129,15 +135,18 @@ class TextRnnAE:
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
 
+        # When tie_embeddings=True, this should always print True
+        #print(TextRnnAE.are_equal_tensors(self.decoder.out.weight, self.encoder.embedding.weight))
+
         return loss.item() / (num_steps)
 
 
-    def evaluate(self, input, max_steps=100): # Right now, we assume that inputs and lengths are sorted
+    def evaluate(self, input, max_steps=100):
         batch_size, _ = input.shape
         # Initialize hidden state
         self.encoder.hidden = self.encoder.init_hidden(batch_size)
 
-        z = self.encoder(input)
+        z, h_enc = self.encoder(input)
         decoded_sequence = self.decoder.generate(z, max_steps=max_steps)
 
         return decoded_sequence
@@ -186,15 +195,16 @@ class Encoder(nn.Module):
         self.linear_dims = params.linear_dims
         self.linear_dims = [self.params.rnn_hidden_dim * self.num_directions * self.params.num_layers * self.num_hidden_states] + self.linear_dims
         # Create Module list of optional (dropout, linear, act_func) blocks
-        self.linears = nn.ModuleList()
-        for i in range(0, len(self.linear_dims)-1):
-           self.linears.append(nn.Dropout(p=self.params.dropout))
-           self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
-           if i < len(self.linear_dims) - 1: # no activation after output layer!!!
-               self.linears.append(nn.ReLU())
+        #self.linears = nn.ModuleList()
+        #for i in range(0, len(self.linear_dims)-1):
+        #   self.linears.append(nn.Dropout(p=self.params.dropout))
+        #   self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
+        #   if i < len(self.linear_dims) - 1: # no activation after output layer!!!
+        #       self.linears.append(nn.ReLU())
         # Define last linear output layer
-        self.last_dropout = nn.Dropout(p=self.params.dropout)
-        self.out = nn.Linear(self.linear_dims[-1], self.params.z_dim)
+        #self.last_dropout = nn.Dropout(p=self.params.dropout)
+        #self.out = nn.Linear(self.linear_dims[-1], self.params.z_dim)
+        self._init_weights()
 
     def init_hidden(self, batch_size):
         if self.params.rnn_type == RnnType.GRU:
@@ -211,13 +221,14 @@ class Encoder(nn.Module):
         # Push through RNN layer (the ouput is irrelevant)
         _, self.hidden = self.rnn(X, self.hidden)
         X = self._flatten_hidden(self.hidden, batch_size)
+
         # Push hidden state to (optional) linear layers
-        for l in self.linears:
-            X = l(X)
+        #for l in self.linears:
+        #    X = l(X)
         # Push trough last linear layer
-        X = self.out(self.last_dropout(X))
+        #X = self.out(self.last_dropout(X))
         # Return final tensor (will be input for decoder)
-        return X
+        return X, self.hidden
 
     def _flatten_hidden(self, h, batch_size):
         if h is None:
@@ -233,6 +244,16 @@ class Encoder(nn.Module):
         # (batch_size, num_directions*num_layers, hidden_dim)  ==>
         # (batch_size, num_directions*num_layers*hidden_dim)
         return h.transpose(0,1).contiguous().view(batch_size, -1)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Embedding):
+                torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+            elif isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.bias.data.fill_(0.01)
+
+
 
 
 
@@ -264,29 +285,44 @@ class Decoder(nn.Module):
                        dropout=self.params.dropout,
                        batch_first=True)
         self.linear_dims = self.params.linear_dims + [self.params.rnn_hidden_dim * self.num_directions * self.params.num_layers * self.num_hidden_states]
-        self.z_to_hidden = nn.Linear(self.params.z_dim, self.linear_dims[0])
+        #self.z_to_hidden = nn.Linear(self.params.z_dim, self.linear_dims[0])
         #
-        self.linears = nn.ModuleList()
-        for i in range(0, len(self.linear_dims)-1):
-            self.linears.append(nn.Dropout(p=self.params.dropout))
-            self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
-            if i < len(self.linear_dims) - 1:
-                self.linears.append(nn.ReLU())
+        #self.linears = nn.ModuleList()
+        #for i in range(0, len(self.linear_dims)-1):
+        #    self.linears.append(nn.Dropout(p=self.params.dropout))
+        #    self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
+        #    if i < len(self.linear_dims) - 1:
+        #        self.linears.append(nn.ReLU())
         # Output layer
-        self.last_dropout = nn.Dropout(p=self.params.dropout)
-        self.out = nn.Linear(self.params.rnn_hidden_dim * self.num_directions, self.params.vocab_size)
+        #self.last_dropout = nn.Dropout(p=self.params.dropout)
+        # If set, tie weights of output layer to weights of embedding layer
+        if self.params.tie_embeddings:
+            # Map hidden_dim to embed_dim (can be dropped if hidden_dim=embed_dim)
+            self.hidden_to_embed = nn.Linear(self.params.rnn_hidden_dim * self.num_directions, self.params.embed_dim)
+            # Weight matrix of self.out has now the same dimension as embedding layer
+            self.out = nn.Linear(self.params.embed_dim, self.params.vocab_size)
+            # Set weights of output layer to embedding weights. Backprop seems to work quite fine with that.
+            self.out.weight = self.embedding.weight
+        else:
+            self.out = nn.Linear(self.params.rnn_hidden_dim * self.num_directions, self.params.vocab_size)
+        self._init_weights()
 
-    def forward(self, inputs, z):
+
+    def forward(self, inputs, z, encoder_hidden):
         batch_size, num_steps = inputs.shape
         # "Expand" z vector
-        X = self.z_to_hidden(z)
+        #X = self.z_to_hidden(z)
+        X = z
         # Push hidden state to (optional) linear layers
-        for l in self.linears:
-            X = l(X)
+        #for l in self.linears:
+        #    X = l(X)
         # Unflatten hidden state for GRU or LSTM
         hidden = self._unflatten_hidden(X, batch_size)
+        #print(TextRnnAE.are_equal_tensors(hidden, encoder_hidden))
         # Restructure shape of hidden state to accommodate bidirectional encoder (decoder is unidirectional)
         hidden = self._init_hidden_state(hidden)
+        #print(TextRnnAE.are_equal_tensors(hidden, encoder_hidden)) # Also True of unidirectional encoder
+        #print(TextRnnAE.are_equal_tensors(hidden[1], encoder_hidden[1]))
         # Create SOS token tensor as first input for decoder
         input = torch.LongTensor([[Token.SOS]] * batch_size).to(self.device)
         # Decide whether to do teacher forcing or not
@@ -316,8 +352,8 @@ class Decoder(nn.Module):
     def generate(self, z, max_steps):
         decoded_sequence = []
         # "Expand" z vector
-        X = self.z_to_hidden(z)
-        #X = z
+        #X = self.z_to_hidden(z)
+        X = z
         # Push hidden state to (optional) linear layers
         #for l in self.linears:
         #    X = l(X)
@@ -347,7 +383,12 @@ class Decoder(nn.Module):
         # Push input word through rnn layer with current hidden state
         output, hidden = self.rnn(X, hidden)
         # Push output through linear layer to get to vocab_size
-        output = F.log_softmax(self.out(self.last_dropout(output.squeeze(dim=1))), dim=1)
+
+        if self.params.tie_embeddings == True:
+            output = F.log_softmax(self.out(self.hidden_to_embed(output.squeeze(dim=1))), dim=1)
+        else:
+            #output = F.log_softmax(self.out(self.last_dropout(output.squeeze(dim=1))), dim=1)
+            output = F.log_softmax(self.out(output.squeeze(dim=1)), dim=1)
         # return the output (batch_size, vocab_size) and new hidden state
         return output, hidden
 
@@ -361,8 +402,15 @@ class Decoder(nn.Module):
             return self._concat_directions(encoder_hidden)
 
     def _concat_directions(self, hidden):
+        # hidden.shape = (num_layers * num_directions, batch_size, hidden_dim)
+        #print(hidden.shape, hidden[0:hidden.size(0):2].shape)
         if self.params.bidirectional_encoder:
             hidden = torch.cat([hidden[0:hidden.size(0):2], hidden[1:hidden.size(0):2]], 2)
+            # Alternative approach (same output but easier to understand)
+            #h = hidden.view(self.params.num_layers, self.num_directions, hidden.size(1), self.params.rnn_hidden_dim)
+            #h_fwd = h[:, 0, :, :]
+            #h_bwd = h[:, 1, :, :]
+            #hidden = torch.cat([h_fwd, h_bwd], 2)
         return hidden
 
 
@@ -381,5 +429,13 @@ class Decoder(nn.Module):
         # (batch_size, num_directions * num_layers, hidden_dim) ==>
         # (num_layers * num_directions, batch_size, hidden_dim) ==>
         return X.view(batch_size, self.params.num_layers * self.num_directions, self.params.rnn_hidden_dim).transpose(0, 1).contiguous()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Embedding):
+                torch.nn.init.uniform_(m.weight, -0.001, 0.001)
+            elif isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                m.bias.data.fill_(0.01)
 
 
