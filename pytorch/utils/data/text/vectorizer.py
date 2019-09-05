@@ -13,6 +13,11 @@ class Vectorizer:
         self.idx_offset = len(self.default_indexes)
 
 
+    def save_dictionary(self, dictionary_file_name):
+        with open(dictionary_file_name, 'w') as f:
+            print(self.vocabulary.index_to_word, file=f)
+
+
     def load_dictionary(self, file_name, word_col, idx_col=None, sep=' '):
         offset = 1
         with open(file_name) as infile:
@@ -115,7 +120,6 @@ class Vectorizer:
             sequences = np.array([ seq + [padding_idx]*(max_seq_len - len(seq)) for seq in sequences ])
         else:
             sequences = [  np.array(seq) for seq in sequences ]
-            print(sequences)
 
         if return_lengths is True:
             return np.array(sequences), np.array(valid_indices), np.array(lengths)
