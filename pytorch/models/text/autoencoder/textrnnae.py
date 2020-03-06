@@ -125,8 +125,13 @@ class TextRnnAE:
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
 
-        z, h_enc = self.encoder(inputs)
-        loss = self.decoder(inputs, z, h_enc)
+        #mean, logv, z = self.encoder(inputs)
+        z = self.encoder(inputs)
+        loss = self.decoder(inputs, z)
+
+        #kld_loss = (-0.5 * torch.sum((logv - torch.pow(mean, 2) - torch.exp(logv) + 1), 1)).mean()
+
+        #loss += (kld_loss * 0.01)
 
         # Backpropagation
         loss.backward()
@@ -141,15 +146,20 @@ class TextRnnAE:
         return loss.item() / (num_steps)
 
 
-    def evaluate(self, input, max_steps=100):
+    def evaluate(self, input, max_steps=100, use_mean=False):
         batch_size, _ = input.shape
         # Initialize hidden state
         self.encoder.hidden = self.encoder.init_hidden(batch_size)
 
-        z, h_enc = self.encoder(input)
+        #mean, logv, z = self.encoder(input)
+        z = self.encoder(input)
+        #if use_mean == True:
+        #    decoded_sequence = self.decoder.generate(mean, max_steps=max_steps)
+        #else:
+        #    decoded_sequence = self.decoder.generate(z, max_steps=max_steps)
         decoded_sequence = self.decoder.generate(z, max_steps=max_steps)
 
-        return decoded_sequence
+        return decoded_sequence, z
 
 
     def save_models(self, encoder_file_name, decoder_file_name):
@@ -194,16 +204,10 @@ class Encoder(nn.Module):
         # Define linear layers
         self.linear_dims = params.linear_dims
         self.linear_dims = [self.params.rnn_hidden_dim * self.num_directions * self.params.num_layers * self.num_hidden_states] + self.linear_dims
-        # Create Module list of optional (dropout, linear, act_func) blocks
-        #self.linears = nn.ModuleList()
-        #for i in range(0, len(self.linear_dims)-1):
-        #   self.linears.append(nn.Dropout(p=self.params.dropout))
-        #   self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
-        #   if i < len(self.linear_dims) - 1: # no activation after output layer!!!
-        #       self.linears.append(nn.ReLU())
         # Define last linear output layer
         #self.last_dropout = nn.Dropout(p=self.params.dropout)
-        #self.out = nn.Linear(self.linear_dims[-1], self.params.z_dim)
+        #self.hidden_to_mean = nn.Linear(self.linear_dims[-1], self.params.z_dim)
+        #self.hidden_to_logv = nn.Linear(self.linear_dims[-1], self.params.z_dim)
         self._init_weights()
 
     def init_hidden(self, batch_size):
@@ -221,14 +225,15 @@ class Encoder(nn.Module):
         # Push through RNN layer (the ouput is irrelevant)
         _, self.hidden = self.rnn(X, self.hidden)
         X = self._flatten_hidden(self.hidden, batch_size)
-
-        # Push hidden state to (optional) linear layers
-        #for l in self.linears:
-        #    X = l(X)
+        return X
         # Push trough last linear layer
         #X = self.out(self.last_dropout(X))
+        #mean = self.hidden_to_mean(X)
+        #logv = self.hidden_to_logv(X)
+        #z = self._sample(mean, logv)
         # Return final tensor (will be input for decoder)
-        return X, self.hidden
+        #return mean, self.hidden
+        #return mean, logv, z
 
     def _flatten_hidden(self, h, batch_size):
         if h is None:
@@ -253,6 +258,13 @@ class Encoder(nn.Module):
                 torch.nn.init.xavier_uniform_(m.weight)
                 m.bias.data.fill_(0.01)
 
+    def _sample(self, mean, logv):
+        std = torch.exp(0.5 * logv)
+        # torch.randn_like() creates a tensor with values samples from N(0,1) and std.shape
+        eps = torch.randn_like(std)
+        # Sampling from Z~N(μ, σ^2) = Sampling from μ + σX, X~N(0,1)
+        z = mean + std * eps
+        return z
 
 
 
@@ -286,13 +298,6 @@ class Decoder(nn.Module):
                        batch_first=True)
         self.linear_dims = self.params.linear_dims + [self.params.rnn_hidden_dim * self.num_directions * self.params.num_layers * self.num_hidden_states]
         #self.z_to_hidden = nn.Linear(self.params.z_dim, self.linear_dims[0])
-        #
-        #self.linears = nn.ModuleList()
-        #for i in range(0, len(self.linear_dims)-1):
-        #    self.linears.append(nn.Dropout(p=self.params.dropout))
-        #    self.linears.append(nn.Linear(self.linear_dims[i], self.linear_dims[i+1]))
-        #    if i < len(self.linear_dims) - 1:
-        #        self.linears.append(nn.ReLU())
         # Output layer
         #self.last_dropout = nn.Dropout(p=self.params.dropout)
         # If set, tie weights of output layer to weights of embedding layer
@@ -308,30 +313,27 @@ class Decoder(nn.Module):
         self._init_weights()
 
 
-    def forward(self, inputs, z, encoder_hidden):
+    def forward(self, inputs, z, return_outputs=False):
         batch_size, num_steps = inputs.shape
         # "Expand" z vector
         #X = self.z_to_hidden(z)
         X = z
-        # Push hidden state to (optional) linear layers
-        #for l in self.linears:
-        #    X = l(X)
         # Unflatten hidden state for GRU or LSTM
         hidden = self._unflatten_hidden(X, batch_size)
-        #print(TextRnnAE.are_equal_tensors(hidden, encoder_hidden))
         # Restructure shape of hidden state to accommodate bidirectional encoder (decoder is unidirectional)
         hidden = self._init_hidden_state(hidden)
-        #print(TextRnnAE.are_equal_tensors(hidden, encoder_hidden)) # Also True of unidirectional encoder
-        #print(TextRnnAE.are_equal_tensors(hidden[1], encoder_hidden[1]))
         # Create SOS token tensor as first input for decoder
         input = torch.LongTensor([[Token.SOS]] * batch_size).to(self.device)
         # Decide whether to do teacher forcing or not
         use_teacher_forcing = random.random() < self.params.teacher_forcing_prob
         # Initiliaze loss
         loss = 0
+        outputs = torch.zeros((batch_size, num_steps), dtype=torch.long).to(self.device)
         if use_teacher_forcing:
             for i in range(num_steps):
                 output, hidden = self._step(input, hidden)
+                topv, topi = output.topk(1)
+                outputs[:,i] = topi.detach().squeeze()
                 #print(output[0], inputs[:, i][0])
                 loss += self.criterion(output, inputs[:, i])
                 input = inputs[:, i].unsqueeze(dim=1)
@@ -340,12 +342,16 @@ class Decoder(nn.Module):
                 output, hidden = self._step(input, hidden)
                 topv, topi = output.topk(1)
                 input = topi.detach()
+                outputs[:, i] = topi.detach().squeeze()
                 #print(topi[0], inputs[:, i][0])
                 loss += self.criterion(output, inputs[:, i])
                 if input[0].item() == Token.EOS:
                     break
         # Return loss
-        return loss
+        if return_outputs == True:
+            return loss, outputs
+        else:
+            return loss
 
 
     # NOTE: Does not work with batch because of loop
@@ -354,9 +360,6 @@ class Decoder(nn.Module):
         # "Expand" z vector
         #X = self.z_to_hidden(z)
         X = z
-        # Push hidden state to (optional) linear layers
-        #for l in self.linears:
-        #    X = l(X)
         # Unflatten hidden state for GRU or LSTM
         hidden = self._unflatten_hidden(X, 1)
         # Restructure shape of hidden state to accommodate bidirectional encoder (decoder is unidirectional)
